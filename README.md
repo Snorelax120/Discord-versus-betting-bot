@@ -216,4 +216,4 @@ This bot is designed for entertainment purposes with virtual currency only. When
 
 ---
 
-**Made with ❤️ for Discord communities** 
+**Made with ❤️ for Discord communities**
