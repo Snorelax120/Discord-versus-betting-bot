@@ -1,7 +1,7 @@
 import aiosqlite
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 import logging
 from config import Config
@@ -188,7 +188,6 @@ class UserManager:
             return True
         
         # Check if 24 hours have passed
-        from datetime import datetime, timedelta
         last_claim = datetime.fromisoformat(user.last_daily_claim.replace('Z', '+00:00'))
         next_claim = last_claim + timedelta(hours=24)
         
@@ -228,7 +227,6 @@ class UserManager:
             return True
         
         # Check if 24 hours have passed
-        from datetime import datetime, timedelta
         last_claim = datetime.fromisoformat(user.last_bailout_claim.replace('Z', '+00:00'))
         next_claim = last_claim + timedelta(hours=24)
         
@@ -369,6 +367,281 @@ class UserManager:
         logger.info(f"Refreshed betting statistics for {count} users")
         return count
 
-# Global database manager instance
+class ActivityManager:
+    """Manage activity tracking and rewards"""
+    
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
+    
+    async def track_message(self, user_id: int, guild_id: int, channel_id: int, message_length: int) -> bool:
+        """Track a message for activity rewards (returns True if tracked, False if on cooldown)"""
+        now = datetime.now(timezone.utc)
+        hour_bucket = now.strftime('%Y-%m-%d-%H')
+        now_str = now.isoformat()
+        
+        # Check settings for this guild
+        settings = await self.get_activity_settings(guild_id)
+        if not settings.get('enabled', True):
+            return False
+        
+        # Check message length requirement
+        if message_length < settings.get('min_message_length', 3):
+            return False
+        
+        conn = await self.db.get_connection()
+        
+        try:
+            # Check if user has existing record for this hour
+            existing = await conn.execute(
+                "SELECT message_count, last_message_time FROM activity_messages WHERE user_id = ? AND guild_id = ? AND hour_bucket = ?",
+                (user_id, guild_id, hour_bucket)
+            )
+            row = await existing.fetchone()
+            
+            if row:
+                message_count, last_message_time = row
+                
+                # Check cooldown
+                last_time = datetime.fromisoformat(last_message_time)
+                cooldown_seconds = settings.get('message_cooldown', 60)
+                if (now - last_time).total_seconds() < cooldown_seconds:
+                    return False
+                
+                # Check max messages per hour
+                max_messages = settings.get('max_messages_per_hour', 50)
+                if message_count >= max_messages:
+                    return False
+                
+                # Update existing record
+                await conn.execute("""
+                    UPDATE activity_messages 
+                    SET message_count = message_count + 1, last_message_time = ?, updated_at = ?
+                    WHERE user_id = ? AND guild_id = ? AND hour_bucket = ?
+                """, (now_str, now_str, user_id, guild_id, hour_bucket))
+            else:
+                # Create new record
+                await conn.execute("""
+                    INSERT INTO activity_messages (user_id, guild_id, channel_id, message_count, last_message_time, hour_bucket, created_at, updated_at)
+                    VALUES (?, ?, ?, 1, ?, ?, ?, ?)
+                """, (user_id, guild_id, channel_id, now_str, hour_bucket, now_str, now_str))
+            
+            await conn.commit()
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error tracking message: {e}")
+            await conn.rollback()
+            return False
+    
+    async def process_hourly_rewards(self, guild_id: int = None) -> Dict[str, int]:
+        """Process activity rewards for the previous hour"""
+        now = datetime.now(timezone.utc)
+        # Process previous hour to ensure it's complete
+        target_hour = (now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1))
+        hour_bucket = target_hour.strftime('%Y-%m-%d-%H')
+        
+        conn = await self.db.get_connection()
+        results = {'users_processed': 0, 'total_points_awarded': 0, 'guilds_processed': 0}
+        
+        try:
+            # Get all activity for the target hour
+            query = """
+                SELECT user_id, guild_id, message_count 
+                FROM activity_messages 
+                WHERE hour_bucket = ?
+            """
+            params = [hour_bucket]
+            
+            if guild_id:
+                query += " AND guild_id = ?"
+                params.append(guild_id)
+            
+            cursor = await conn.execute(query, params)
+            activities = await cursor.fetchall()
+            
+            guilds_processed = set()
+            
+            for user_id, guild_id, message_count in activities:
+                # Get settings for this guild
+                settings = await self.get_activity_settings(guild_id)
+                if not settings.get('enabled', True):
+                    continue
+                
+                # Calculate points
+                points_per_message = settings.get('points_per_message', 2)
+                bonus_multiplier = settings.get('bonus_multiplier', 1.0)
+                points_earned = int(message_count * points_per_message * bonus_multiplier)
+                
+                if points_earned > 0:
+                    # Award points to user
+                    await user_manager.add_points(user_id, points_earned, 
+                                                f"Activity reward for {message_count} messages")
+                    
+                    # Record the reward
+                    await conn.execute("""
+                        INSERT INTO activity_rewards (user_id, guild_id, points_earned, messages_counted, hour_bucket, bonus_multiplier, processed_at, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (user_id, guild_id, points_earned, message_count, hour_bucket, bonus_multiplier, now.isoformat(), now.isoformat()))
+                    
+                    results['users_processed'] += 1
+                    results['total_points_awarded'] += points_earned
+                    guilds_processed.add(guild_id)
+            
+            results['guilds_processed'] = len(guilds_processed)
+            await conn.commit()
+            
+        except Exception as e:
+            logger.error(f"Error processing hourly rewards: {e}")
+            await conn.rollback()
+        
+        return results
+    
+    async def get_activity_settings(self, guild_id: int) -> Dict[str, Any]:
+        """Get activity settings for a guild"""
+        conn = await self.db.get_connection()
+        
+        cursor = await conn.execute(
+            "SELECT * FROM activity_settings WHERE guild_id = ?", (guild_id,)
+        )
+        row = await cursor.fetchone()
+        
+        if row:
+            return {
+                'guild_id': row[0],
+                'enabled': bool(row[1]),
+                'points_per_message': row[2],
+                'message_cooldown': row[3],
+                'max_messages_per_hour': row[4],
+                'min_message_length': row[5],
+                'bonus_multiplier': row[6],
+                'excluded_channels': json.loads(row[7]),
+                'excluded_roles': json.loads(row[8])
+            }
+        else:
+            # Return default settings
+            return {
+                'guild_id': guild_id,
+                'enabled': True,
+                'points_per_message': 2,
+                'message_cooldown': 60,
+                'max_messages_per_hour': 50,
+                'min_message_length': 3,
+                'bonus_multiplier': 1.0,
+                'excluded_channels': [],
+                'excluded_roles': []
+            }
+    
+    async def update_activity_settings(self, guild_id: int, settings: Dict[str, Any]) -> bool:
+        """Update activity settings for a guild"""
+        now = datetime.now(timezone.utc).isoformat()
+        conn = await self.db.get_connection()
+        
+        try:
+            # Check if settings exist
+            cursor = await conn.execute("SELECT guild_id FROM activity_settings WHERE guild_id = ?", (guild_id,))
+            exists = await cursor.fetchone()
+            
+            excluded_channels = json.dumps(settings.get('excluded_channels', []))
+            excluded_roles = json.dumps(settings.get('excluded_roles', []))
+            
+            if exists:
+                await conn.execute("""
+                    UPDATE activity_settings 
+                    SET enabled = ?, points_per_message = ?, message_cooldown = ?, 
+                        max_messages_per_hour = ?, min_message_length = ?, bonus_multiplier = ?,
+                        excluded_channels = ?, excluded_roles = ?, updated_at = ?
+                    WHERE guild_id = ?
+                """, (
+                    settings.get('enabled', True),
+                    settings.get('points_per_message', 2),
+                    settings.get('message_cooldown', 60),
+                    settings.get('max_messages_per_hour', 50),
+                    settings.get('min_message_length', 3),
+                    settings.get('bonus_multiplier', 1.0),
+                    excluded_channels,
+                    excluded_roles,
+                    now,
+                    guild_id
+                ))
+            else:
+                await conn.execute("""
+                    INSERT INTO activity_settings 
+                    (guild_id, enabled, points_per_message, message_cooldown, max_messages_per_hour, 
+                     min_message_length, bonus_multiplier, excluded_channels, excluded_roles, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    guild_id,
+                    settings.get('enabled', True),
+                    settings.get('points_per_message', 2),
+                    settings.get('message_cooldown', 60),
+                    settings.get('max_messages_per_hour', 50),
+                    settings.get('min_message_length', 3),
+                    settings.get('bonus_multiplier', 1.0),
+                    excluded_channels,
+                    excluded_roles,
+                    now,
+                    now
+                ))
+            
+            await conn.commit()
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error updating activity settings: {e}")
+            await conn.rollback()
+            return False
+    
+    async def get_user_activity_stats(self, user_id: int, guild_id: int = None, days: int = 7) -> Dict[str, Any]:
+        """Get activity statistics for a user"""
+        conn = await self.db.get_connection()
+        
+        # Calculate date range
+        end_date = datetime.now(timezone.utc)
+        start_date = end_date - timedelta(days=days)
+        start_bucket = start_date.strftime('%Y-%m-%d-%H')
+        end_bucket = end_date.strftime('%Y-%m-%d-%H')
+        
+        try:
+            # Get activity rewards for the period
+            query = """
+                SELECT COUNT(*) as reward_count, SUM(points_earned) as total_points, SUM(messages_counted) as total_messages
+                FROM activity_rewards 
+                WHERE user_id = ? AND hour_bucket >= ? AND hour_bucket <= ?
+            """
+            params = [user_id, start_bucket, end_bucket]
+            
+            if guild_id:
+                query += " AND guild_id = ?"
+                params.append(guild_id)
+            
+            cursor = await conn.execute(query, params)
+            row = await cursor.fetchone()
+            
+            reward_count, total_points, total_messages = row if row else (0, 0, 0)
+            
+            return {
+                'reward_periods': reward_count or 0,
+                'total_points_earned': total_points or 0,
+                'total_messages': total_messages or 0,
+                'days_tracked': days,
+                'average_points_per_day': round((total_points or 0) / days, 1),
+                'average_messages_per_day': round((total_messages or 0) / days, 1)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting user activity stats: {e}")
+            return {
+                'reward_periods': 0,
+                'total_points_earned': 0, 
+                'total_messages': 0,
+                'days_tracked': days,
+                'average_points_per_day': 0.0,
+                'average_messages_per_day': 0.0
+            }
+
+# Create global activity manager instance
+activity_manager = None
+
+# Global database manager instances
 db_manager = DatabaseManager()
 user_manager = UserManager(db_manager)

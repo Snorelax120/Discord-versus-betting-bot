@@ -93,10 +93,8 @@ class DatabaseModels:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 guild_id INTEGER PRIMARY KEY,
-                betting_channels TEXT,
-                announcement_channel INTEGER NULL,
-                bet_history_channel INTEGER NULL,
-                starting_balance INTEGER DEFAULT 1000,
+                command_prefix TEXT DEFAULT '!',
+                default_balance INTEGER DEFAULT 1000,
                 daily_bonus_amount INTEGER DEFAULT 100,
                 bailout_amount INTEGER DEFAULT 50,
                 max_bet_percentage INTEGER DEFAULT 50,
@@ -107,6 +105,52 @@ class DatabaseModels:
             )
         """)
         
+        # Activity tracking tables
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS activity_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                message_count INTEGER DEFAULT 1,
+                last_message_time TEXT NOT NULL,
+                hour_bucket TEXT NOT NULL,  -- Format: YYYY-MM-DD-HH for grouping
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(user_id, guild_id, hour_bucket)
+            )
+        """)
+        
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS activity_rewards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                guild_id INTEGER NOT NULL,
+                points_earned INTEGER NOT NULL,
+                messages_counted INTEGER NOT NULL,
+                hour_bucket TEXT NOT NULL,
+                bonus_multiplier REAL DEFAULT 1.0,
+                processed_at TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS activity_settings (
+                guild_id INTEGER PRIMARY KEY,
+                enabled BOOLEAN DEFAULT TRUE,
+                points_per_message INTEGER DEFAULT 2,
+                message_cooldown INTEGER DEFAULT 60,
+                max_messages_per_hour INTEGER DEFAULT 50,
+                min_message_length INTEGER DEFAULT 3,
+                bonus_multiplier REAL DEFAULT 1.0,
+                excluded_channels TEXT DEFAULT '[]',  -- JSON array of channel IDs
+                excluded_roles TEXT DEFAULT '[]',     -- JSON array of role IDs
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
         # Create indexes
         await db.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_bets_creator ON bets(creator_id)")
@@ -116,6 +160,13 @@ class DatabaseModels:
         await db.execute("CREATE INDEX IF NOT EXISTS idx_transactions_user ON transactions(user_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_transactions_type ON transactions(transaction_type)")
         
+        # Activity indexes for performance
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_activity_messages_user_guild ON activity_messages(user_id, guild_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_activity_messages_hour ON activity_messages(hour_bucket)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_activity_rewards_user_guild ON activity_rewards(user_id, guild_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_activity_rewards_hour ON activity_rewards(hour_bucket)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_activity_settings_guild ON activity_settings(guild_id)")
+
         await db.commit()
         logger.info("Database tables created successfully")
 

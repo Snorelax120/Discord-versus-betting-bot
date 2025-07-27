@@ -50,9 +50,10 @@ class BettingBot(commands.Bot):
             await self.load_extension('cogs.economy')
             await self.load_extension('cogs.betting')
             await self.load_extension('cogs.admin')
+            await self.load_extension('cogs.activity')
             logger.info("All cogs loaded successfully")
         except Exception as e:
-            logger.error(f"Failed to load economy cog: {e}")
+            logger.error(f"Failed to load cogs: {e}")
     
     async def on_ready(self):
         """Called when bot is fully ready"""
@@ -173,6 +174,15 @@ async def help_command(ctx):
               "`!bailout` - Emergency points when balance is 0\n"
               "`!leaderboard [limit]` - Show top users\n"
               "`!stats [@user]` - Show detailed user statistics",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🎯 Activity Rewards",
+        value="`!activity stats [@user]` - View activity statistics\n"
+              "`!activity settings` - View/configure activity system (admins)\n"
+              "`!activity toggle` - Enable/disable activity tracking (admins)\n"
+              "🔥 **Auto Rewards**: Earn points by chatting! 2 points per message.",
         inline=False
     )
     
