@@ -182,7 +182,7 @@ async def help_command(ctx):
         value="`!activity stats [@user]` - View activity statistics\n"
               "`!activity settings` - View/configure activity system (admins)\n"
               "`!activity toggle` - Enable/disable activity tracking (admins)\n"
-              "🔥 **Auto Rewards**: Earn points by chatting! 2 points per message.",
+              "🏭 **Production Mode**: Earn 2 points per message, 10-min cooldown, daily rewards!",
         inline=False
     )
     

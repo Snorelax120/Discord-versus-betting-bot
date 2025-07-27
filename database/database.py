@@ -403,7 +403,7 @@ class ActivityManager:
                 
                 # Check cooldown
                 last_time = datetime.fromisoformat(last_message_time)
-                cooldown_seconds = settings.get('message_cooldown', 60)
+                cooldown_seconds = settings.get('message_cooldown', 600)
                 if (now - last_time).total_seconds() < cooldown_seconds:
                     return False
                 
@@ -433,24 +433,30 @@ class ActivityManager:
             await conn.rollback()
             return False
     
-    async def process_hourly_rewards(self, guild_id: int = None) -> Dict[str, int]:
-        """Process activity rewards for the previous hour"""
+    async def process_daily_rewards(self, guild_id: int = None) -> Dict[str, int]:
+        """Process activity rewards for the last 24 hours (daily batch)"""
         now = datetime.now(timezone.utc)
-        # Process previous hour to ensure it's complete
-        target_hour = (now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1))
-        hour_bucket = target_hour.strftime('%Y-%m-%d-%H')
+        # Process last 24 hours of activity
+        end_time = now.replace(hour=0, minute=0, second=0, microsecond=0)  # Start of today
+        start_time = end_time - timedelta(days=1)  # Start of yesterday
+        
+        # Create day bucket for tracking (YYYY-MM-DD format)
+        day_bucket = end_time.strftime('%Y-%m-%d')
         
         conn = await self.db.get_connection()
         results = {'users_processed': 0, 'total_points_awarded': 0, 'guilds_processed': 0}
         
         try:
-            # Get all activity for the target hour
+            # Get all activity for the last 24 hours (sum by user and guild)
             query = """
-                SELECT user_id, guild_id, message_count 
+                SELECT user_id, guild_id, SUM(message_count) as total_messages
                 FROM activity_messages 
-                WHERE hour_bucket = ?
+                WHERE hour_bucket >= ? AND hour_bucket < ?
+                GROUP BY user_id, guild_id
             """
-            params = [hour_bucket]
+            start_bucket = start_time.strftime('%Y-%m-%d-%H')
+            end_bucket = end_time.strftime('%Y-%m-%d-%H')
+            params = [start_bucket, end_bucket]
             
             if guild_id:
                 query += " AND guild_id = ?"
@@ -461,21 +467,131 @@ class ActivityManager:
             
             guilds_processed = set()
             
-            for user_id, guild_id, message_count in activities:
+            for user_id, guild_id, total_messages in activities:
+                # Check if already rewarded for this day
+                existing_reward = await conn.execute("""
+                    SELECT messages_counted FROM activity_rewards 
+                    WHERE user_id = ? AND guild_id = ? AND hour_bucket = ?
+                    ORDER BY processed_at DESC LIMIT 1
+                """, (user_id, guild_id, day_bucket))
+                
+                reward_row = await existing_reward.fetchone()
+                already_rewarded_messages = reward_row[0] if reward_row else 0
+                
+                # Only process if there are new messages to reward
+                new_messages = total_messages - already_rewarded_messages
+                if new_messages <= 0:
+                    continue
+                
                 # Get settings for this guild
                 settings = await self.get_activity_settings(guild_id)
                 if not settings.get('enabled', True):
                     continue
                 
-                # Calculate points
+                # Calculate points for new messages only
                 points_per_message = settings.get('points_per_message', 2)
                 bonus_multiplier = settings.get('bonus_multiplier', 1.0)
-                points_earned = int(message_count * points_per_message * bonus_multiplier)
+                
+                # Apply daily cap (max messages per day = max_per_hour * 16 active hours)
+                max_daily_messages = settings.get('max_messages_per_hour', 50) * 16
+                capped_messages = min(new_messages, max_daily_messages)
+                
+                points_earned = int(capped_messages * points_per_message * bonus_multiplier)
                 
                 if points_earned > 0:
                     # Award points to user
                     await user_manager.add_points(user_id, points_earned, 
-                                                f"Activity reward for {message_count} messages")
+                                                'activity_reward',
+                                                description=f"Daily activity reward for {capped_messages} messages")
+                    
+                    # Record the reward (using day bucket instead of hour bucket)
+                    await conn.execute("""
+                        INSERT INTO activity_rewards (user_id, guild_id, points_earned, messages_counted, hour_bucket, bonus_multiplier, processed_at, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (user_id, guild_id, points_earned, total_messages, day_bucket, bonus_multiplier, now.isoformat(), now.isoformat()))
+                    
+                    results['users_processed'] += 1
+                    results['total_points_awarded'] += points_earned
+                    guilds_processed.add(guild_id)
+            
+            results['guilds_processed'] = len(guilds_processed)
+            await conn.commit()
+            
+        except Exception as e:
+            logger.error(f"Error processing daily activity rewards: {e}")
+            await conn.rollback()
+        
+        return results
+
+    async def process_hourly_rewards(self, guild_id: int = None) -> Dict[str, int]:
+        """Process activity rewards for current/recent activity (testing mode)"""
+        now = datetime.now(timezone.utc)
+        # For testing: process current hour AND previous hour to catch all recent activity
+        current_hour = now.replace(minute=0, second=0, microsecond=0)
+        previous_hour = current_hour - timedelta(hours=1)
+        
+        current_bucket = current_hour.strftime('%Y-%m-%d-%H')
+        previous_bucket = previous_hour.strftime('%Y-%m-%d-%H')
+        
+        conn = await self.db.get_connection()
+        results = {'users_processed': 0, 'total_points_awarded': 0, 'guilds_processed': 0}
+        
+        try:
+            # Get all activity for both current and previous hour (testing mode)
+            query = """
+                SELECT user_id, guild_id, message_count, hour_bucket
+                FROM activity_messages 
+                WHERE hour_bucket IN (?, ?)
+            """
+            params = [current_bucket, previous_bucket]
+            
+            if guild_id:
+                query += " AND guild_id = ?"
+                params.append(guild_id)
+            
+            cursor = await conn.execute(query, params)
+            activities = await cursor.fetchall()
+            
+            guilds_processed = set()
+            processed_buckets = set()
+            
+            for user_id, guild_id, message_count, hour_bucket in activities:
+                # Skip if we already processed this user for this hour in this batch
+                processing_key = f"{user_id}_{guild_id}_{hour_bucket}"
+                if processing_key in processed_buckets:
+                    continue
+                processed_buckets.add(processing_key)
+                
+                # Check if already rewarded for this hour and how many messages were rewarded
+                existing_reward = await conn.execute("""
+                    SELECT messages_counted FROM activity_rewards 
+                    WHERE user_id = ? AND guild_id = ? AND hour_bucket = ?
+                    ORDER BY processed_at DESC LIMIT 1
+                """, (user_id, guild_id, hour_bucket))
+                
+                reward_row = await existing_reward.fetchone()
+                already_rewarded_messages = reward_row[0] if reward_row else 0
+                
+                # Only process if there are new messages to reward
+                new_messages = message_count - already_rewarded_messages
+                if new_messages <= 0:
+                    continue
+                
+                # Get settings for this guild
+                settings = await self.get_activity_settings(guild_id)
+                if not settings.get('enabled', True):
+                    continue
+                
+                # Calculate points for new messages only
+                points_per_message = settings.get('points_per_message', 2)
+                bonus_multiplier = settings.get('bonus_multiplier', 1.0)
+                points_earned = int(new_messages * points_per_message * bonus_multiplier)
+                
+                if points_earned > 0:
+                    # Award points to user
+                    await user_manager.add_points(user_id, points_earned, 
+                                                'activity_reward',
+                                                description=f"Activity reward for {new_messages} new messages ({message_count} total)")
                     
                     # Record the reward
                     await conn.execute("""
@@ -491,7 +607,7 @@ class ActivityManager:
             await conn.commit()
             
         except Exception as e:
-            logger.error(f"Error processing hourly rewards: {e}")
+            logger.error(f"Error processing activity rewards: {e}")
             await conn.rollback()
         
         return results
@@ -523,7 +639,7 @@ class ActivityManager:
                 'guild_id': guild_id,
                 'enabled': True,
                 'points_per_message': 2,
-                'message_cooldown': 60,
+                'message_cooldown': 600,
                 'max_messages_per_hour': 50,
                 'min_message_length': 3,
                 'bonus_multiplier': 1.0,
@@ -554,7 +670,7 @@ class ActivityManager:
                 """, (
                     settings.get('enabled', True),
                     settings.get('points_per_message', 2),
-                    settings.get('message_cooldown', 60),
+                    settings.get('message_cooldown', 600),
                     settings.get('max_messages_per_hour', 50),
                     settings.get('min_message_length', 3),
                     settings.get('bonus_multiplier', 1.0),
@@ -573,7 +689,7 @@ class ActivityManager:
                     guild_id,
                     settings.get('enabled', True),
                     settings.get('points_per_message', 2),
-                    settings.get('message_cooldown', 60),
+                    settings.get('message_cooldown', 600),
                     settings.get('max_messages_per_hour', 50),
                     settings.get('min_message_length', 3),
                     settings.get('bonus_multiplier', 1.0),

@@ -86,20 +86,20 @@ class Activity(commands.Cog):
                     if v > cutoff_time
                 }
     
-    @tasks.loop(hours=1)
+    @tasks.loop(hours=24)
     async def process_rewards(self):
-        """Process hourly activity rewards"""
+        """Process daily activity rewards (production mode)"""
         if not Config.ACTIVITY_ENABLED:
             return
         
         try:
-            results = await self.activity_manager.process_hourly_rewards()
+            results = await self.activity_manager.process_daily_rewards()
             if results['users_processed'] > 0:
-                logger.info(f"Activity rewards processed: {results['users_processed']} users, "
+                logger.info(f"Daily activity rewards processed: {results['users_processed']} users, "
                            f"{results['total_points_awarded']} points awarded across "
                            f"{results['guilds_processed']} guilds")
         except Exception as e:
-            logger.error(f"Error in hourly reward processing: {e}")
+            logger.error(f"Error in daily reward processing: {e}")
     
     @process_rewards.before_loop
     async def before_process_rewards(self):
@@ -141,9 +141,10 @@ class Activity(commands.Cog):
         embed.add_field(
             name="How It Works",
             value=f"• Earn **{Config.ACTIVITY_POINTS_PER_MESSAGE} points** per message\n"
-                  f"• **{Config.ACTIVITY_MESSAGE_COOLDOWN}s** cooldown between counted messages\n"
+                  f"• **{Config.ACTIVITY_MESSAGE_COOLDOWN//60} minutes** cooldown between counted messages\n"
                   f"• Max **{Config.ACTIVITY_MAX_MESSAGES_PER_HOUR}** messages per hour\n"
-                  f"• Messages must be **{Config.ACTIVITY_MIN_MESSAGE_LENGTH}+** characters",
+                  f"• Messages must be **{Config.ACTIVITY_MIN_MESSAGE_LENGTH}+** characters\n"
+                  f"• 🏭 **Production Mode**: Rewards processed daily at midnight!",
             inline=False
         )
         
@@ -194,7 +195,7 @@ class Activity(commands.Cog):
         )
         
         embed.set_thumbnail(url=target_user.avatar.url if target_user.avatar else target_user.default_avatar.url)
-        embed.set_footer(text="Activity rewards are processed hourly")
+        embed.set_footer(text="🏭 Production Mode: Rewards processed daily at midnight!")
         
         await ctx.send(embed=embed)
     
@@ -377,20 +378,20 @@ class Activity(commands.Cog):
     @activity_group.command(name='process')
     @commands.has_permissions(administrator=True)
     async def process_activity_rewards(self, ctx):
-        """Manually process activity rewards"""
+        """Manually process daily activity rewards (production mode)"""
         embed = discord.Embed(
-            title="🔄 Processing Activity Rewards...",
-            description="Processing rewards for the previous hour...",
+            title="🔄 Processing Daily Activity Rewards...",
+            description="Processing rewards for the last 24 hours...\n🏭 **Production Mode**: Normally processed daily at midnight!",
             color=discord.Color.orange()
         )
         
         message = await ctx.send(embed=embed)
         
         try:
-            results = await self.activity_manager.process_hourly_rewards(ctx.guild.id)
+            results = await self.activity_manager.process_daily_rewards(ctx.guild.id)
             
             embed = discord.Embed(
-                title="✅ Activity Rewards Processed",
+                title="✅ Daily Activity Rewards Processed",
                 color=discord.Color.green()
             )
             

@@ -20,7 +20,7 @@ class Config:
     # Activity Reward settings
     ACTIVITY_ENABLED = os.getenv('ACTIVITY_ENABLED', 'True').lower() == 'true'
     ACTIVITY_POINTS_PER_MESSAGE = int(os.getenv('ACTIVITY_POINTS_PER_MESSAGE', 2))
-    ACTIVITY_MESSAGE_COOLDOWN = int(os.getenv('ACTIVITY_MESSAGE_COOLDOWN', 60))  # seconds
+    ACTIVITY_MESSAGE_COOLDOWN = int(os.getenv('ACTIVITY_MESSAGE_COOLDOWN', 600))  # 10 minutes in seconds
     ACTIVITY_MAX_MESSAGES_PER_HOUR = int(os.getenv('ACTIVITY_MAX_MESSAGES_PER_HOUR', 50))
     ACTIVITY_MIN_MESSAGE_LENGTH = int(os.getenv('ACTIVITY_MIN_MESSAGE_LENGTH', 3))
     ACTIVITY_BONUS_MULTIPLIER = float(os.getenv('ACTIVITY_BONUS_MULTIPLIER', 1.5))  # Weekend/event bonus
