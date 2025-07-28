@@ -149,6 +149,17 @@ class BetListAdminView(discord.ui.View):
             embed.add_field(name="Admin", value=interaction.user.mention, inline=True)
             embed.set_footer(text="Use '🛡️ Admin Resolve' button to resolve when ready.")
             
+            # Update active channel with locked status
+            try:
+                from cogs.channels import Channels
+                channels_cog = interaction.client.get_cog('Channels')
+                if channels_cog:
+                    bet = await bet_manager.get_bet(self.bet_id)
+                    if bet:
+                        await channels_cog.update_active_bet_status(bet, 'locked')
+            except Exception as e:
+                logger.error(f"Error updating locked bet status in channels: {e}")
+            
             await interaction.response.send_message(embed=embed, ephemeral=True)
             logger.info(f"Bet #{self.bet_id} locked by {interaction.user}")
             
@@ -256,6 +267,17 @@ class BetResolutionView(discord.ui.View):
             )
             embed.add_field(name="Admin", value=interaction.user.mention, inline=True)
             embed.set_footer(text="Use the resolution buttons when ready to resolve the bet.")
+            
+            # Update active channel with locked status
+            try:
+                from cogs.channels import Channels
+                channels_cog = interaction.client.get_cog('Channels')
+                if channels_cog:
+                    bet = await bet_manager.get_bet(self.bet_id)
+                    if bet:
+                        await channels_cog.update_active_bet_status(bet, 'locked')
+            except Exception as e:
+                logger.error(f"Error updating locked bet status in channels: {e}")
             
             await interaction.response.send_message(embed=embed)
             logger.info(f"Bet #{self.bet_id} locked by {interaction.user}")
@@ -442,6 +464,15 @@ class BetCancelConfirmModal(discord.ui.Modal):
             
             embed.set_footer(text="All players have been refunded their bet amounts.")
             
+            # Update active channel with cancelled status
+            try:
+                from cogs.channels import Channels
+                channels_cog = interaction.client.get_cog('Channels')
+                if channels_cog:
+                    await channels_cog.update_active_bet_status(bet, 'cancelled')
+            except Exception as e:
+                logger.error(f"Error updating cancelled bet status in channels: {e}")
+            
             await interaction.response.send_message(embed=embed)
             logger.info(f"Bet #{self.bet_id} cancelled by {interaction.user} - Reason: {self.reason_input.value.strip()}")
             
@@ -519,7 +550,7 @@ class BetCreationModal(discord.ui.Modal):
             description = self.description_input.value.strip() or None
             
             bet_id = await bet_manager.create_bet(
-                interaction.user.id, bet_type, title, options, description
+                interaction.user.id, bet_type, title, options, description, interaction.guild.id
             )
             
             # Create success embed
@@ -621,7 +652,7 @@ class QuickYesNoModal(discord.ui.Modal):
             options = ["Yes", "No"]
             
             bet_id = await bet_manager.create_bet(
-                interaction.user.id, 'yn', title, options, description
+                interaction.user.id, 'yn', title, options, description, interaction.guild.id
             )
             
             # Create success embed
@@ -982,12 +1013,13 @@ class BetOptionButton(discord.ui.Button):
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 class BetManager:
-    """Manages bet-related database operations"""
+    """Manage betting operations"""
     
-    def __init__(self, db_manager):
+    def __init__(self, db_manager, bot=None):
         self.db = db_manager
+        self.bot = bot
     
-    async def create_bet(self, creator_id: int, bet_type: str, title: str, options: list, description: str = None) -> int:
+    async def create_bet(self, creator_id: int, bet_type: str, title: str, options: list, description: str = None, guild_id: int = None) -> int:
         """Create a new bet and return bet_id"""
         now = datetime.now(timezone.utc).isoformat()
         options_json = json.dumps(options)
@@ -995,13 +1027,35 @@ class BetManager:
         conn = await self.db.get_connection()
         cursor = await conn.execute("""
             INSERT INTO bets (
-                creator_id, bet_type, title, description, options, 
+                creator_id, guild_id, bet_type, title, description, options, 
                 status, created_at
-            ) VALUES (?, ?, ?, ?, ?, 'open', ?)
-        """, (creator_id, bet_type, title, description, options_json, now))
+            ) VALUES (?, ?, ?, ?, ?, ?, 'open', ?)
+        """, (creator_id, guild_id, bet_type, title, description, options_json, now))
         
+        bet_id = cursor.lastrowid
         await conn.commit()
-        return cursor.lastrowid
+        
+        # Post to active bets channel if configured
+        if guild_id:
+            try:
+                from cogs.channels import Channels
+                channels_cog = self.bot.get_cog('Channels') if hasattr(self, 'bot') else None
+                if channels_cog:
+                    bet_data = {
+                        'bet_id': bet_id,
+                        'creator_id': creator_id,
+                        'bet_type': bet_type,
+                        'title': title,
+                        'description': description,
+                        'options': options,
+                        'min_bet': 1,
+                        'guild_id': guild_id
+                    }
+                    await channels_cog.post_bet_creation(bet_data)
+            except Exception as e:
+                logger.error(f"Error posting bet creation to channel: {e}")
+        
+        return bet_id
     
     async def get_bet(self, bet_id: int):
         """Get bet by ID"""
@@ -1186,6 +1240,21 @@ class BetManager:
         
         await conn.commit()
         
+        # Post to history channel and update active channel if configured
+        if self.bot:
+            try:
+                from cogs.channels import Channels
+                channels_cog = self.bot.get_cog('Channels')
+                if channels_cog:
+                    # Post to history channel
+                    await channels_cog.post_bet_resolution(
+                        bet, winning_option, len(user_bets), bet['total_pool']
+                    )
+                    # Update active channel with resolved status
+                    await channels_cog.update_active_bet_status(bet, 'resolved', winning_option)
+            except Exception as e:
+                logger.error(f"Error posting bet resolution to channels: {e}")
+        
         return {
             'success': True,
             'winners': len(winners),
@@ -1199,10 +1268,13 @@ class BetManager:
 bet_manager = BetManager(db_manager)
 
 class Betting(commands.Cog):
-    """Betting commands for the betting bot"""
+    """Betting commands and functionality"""
     
     def __init__(self, bot):
         self.bot = bot
+        # Update global bet_manager with bot reference
+        global bet_manager
+        bet_manager.bot = bot
     
     @commands.group(name='bet', invoke_without_command=True)
     async def bet_group(self, ctx):
@@ -1277,7 +1349,7 @@ class Betting(commands.Cog):
             # Create yes/no bet
             options = ["Yes", "No"]
             bet_id = await bet_manager.create_bet(
-                ctx.author.id, 'yn', question, options, None
+                ctx.author.id, 'yn', question, options, None, ctx.guild.id
             )
             
             embed = discord.Embed(

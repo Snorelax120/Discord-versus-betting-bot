@@ -51,6 +51,7 @@ class BettingBot(commands.Bot):
             await self.load_extension('cogs.betting')
             await self.load_extension('cogs.admin')
             await self.load_extension('cogs.activity')
+            await self.load_extension('cogs.channels')
             logger.info("All cogs loaded successfully")
         except Exception as e:
             logger.error(f"Failed to load cogs: {e}")
@@ -201,7 +202,10 @@ async def help_command(ctx):
         value="`!bet list` - Shows admin controls in bet list for admins\n"
               "`!admin resolve <bet_id>` - Interactive bet resolution with buttons\n"
               "`!admin setbalance @user <amount>` - Set user balance\n"
-              "`!admin addpoints @user <amount>` - Add points to user",
+              "`!admin addpoints @user <amount>` - Add points to user\n"
+              "`!setchannel setup` - **Auto-create betting channels** 🚀\n"
+              "`!setchannel history #channel` - Set bet history channel\n"
+              "`!setchannel active #channel` - Set active bets channel",
         inline=False
     )
     

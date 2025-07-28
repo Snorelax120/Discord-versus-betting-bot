@@ -38,6 +38,7 @@ class DatabaseModels:
             CREATE TABLE IF NOT EXISTS bets (
                 bet_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 creator_id INTEGER NOT NULL,
+                guild_id INTEGER NOT NULL,
                 bet_type TEXT NOT NULL CHECK (bet_type IN ('yn', 'multi', 'ou', 'odds')),
                 title TEXT NOT NULL,
                 description TEXT,
@@ -52,6 +53,7 @@ class DatabaseModels:
                 created_at TEXT NOT NULL,
                 resolved_at TEXT NULL,
                 winning_option TEXT NULL,
+                active_message_id INTEGER NULL,
                 FOREIGN KEY (creator_id) REFERENCES users (discord_id)
             )
         """)
@@ -100,6 +102,8 @@ class DatabaseModels:
                 max_bet_percentage INTEGER DEFAULT 50,
                 min_participants INTEGER DEFAULT 2,
                 default_lock_time INTEGER DEFAULT 3600,
+                bet_history_channel INTEGER NULL,
+                active_bets_channel INTEGER NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
